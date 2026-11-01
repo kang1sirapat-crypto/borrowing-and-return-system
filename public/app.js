@@ -6,6 +6,325 @@ let currentScannedItem = null;
 let currentReturnTxId = null;
 let currentTxStatusFilter = 'ALL';
 
+// ================= CLOUD / LOCALSTORAGE FALLBACK ENGINE =================
+// Automatically intercepts /api/* calls when hosted on static hosts (GitHub Pages / Vercel)
+(function setupOfflineCloudFallback() {
+  const STORAGE_KEY = 'asset_tracker_cloud_db_v1';
+
+  function getTodayStr(offsetDays = 0) {
+    const d = new Date();
+    d.setDate(d.getDate() + offsetDays);
+    return d.toISOString().split('T')[0];
+  }
+
+  function getNowDateTimeStr(offsetDays = 0) {
+    const d = new Date();
+    d.setDate(d.getDate() + offsetDays);
+    return d.toISOString().replace('T', ' ').substring(0, 19);
+  }
+
+  function loadLocalDb() {
+    try {
+      const raw = localStorage.getItem(STORAGE_KEY);
+      if (raw) return JSON.parse(raw);
+    } catch (e) {
+      console.warn('LocalStorage read error:', e);
+    }
+
+    const initialDb = {
+      nextItemId: 6,
+      nextTxId: 3,
+      items: [
+        { id: 1, code: 'CAM-001', name: 'กล้อง Sony Alpha A6400 + เลนส์ 16-50mm', category: 'อุปกรณ์กล้อง/มีเดีย', location: 'ตู้เก็บกล้อง A1', total_qty: 2, available_qty: 2, unit: 'ชุด', description: 'ชุดกล้องสำหรับงานบันทึกวิดีโอและภาพนิ่ง' },
+        { id: 2, code: 'MIC-101', name: 'ไมโครโฟนไร้สาย DJI Mic 2 (ชุด 2 ตัวส่ง + 1 รับ)', category: 'อุปกรณ์เสียง', location: 'ตู้ A2', total_qty: 3, available_qty: 2, unit: 'เซ็ต', description: 'ไมโครโฟนบันทึกเสียงไร้สายแบบพกพา' },
+        { id: 3, code: 'LAB-OSC-01', name: 'Digital Oscilloscope Rigol DS1054Z', category: 'เครื่องมือวิทยาศาสตร์/แล็บ', location: 'โต๊ะทดลอง 3', total_qty: 4, available_qty: 3, unit: 'เครื่อง', description: 'เครื่องวัดสัญญาณดิจิทัล 4 แชนเนล 50MHz' },
+        { id: 4, code: 'TOOL-DRL-02', name: 'สว่านไร้สาย Bosch GSB 18V-50 พร้อมกล่องดอกสว่าน', category: 'เครื่องมือช่าง', location: 'ชั้นวางช่าง B', total_qty: 2, available_qty: 1, unit: 'กล่อง', description: 'สว่านกระแทกไร้สาย มอเตอร์ไร้แปรงถ่าน' },
+        { id: 5, code: 'PRJ-EPS-01', name: 'โปรเจกเตอร์ Epson EB-X51 (3,800 Lumens)', category: 'อุปกรณ์ห้องประชุม/นำเสนอ', location: 'ห้องพัสดุกลาง', total_qty: 1, available_qty: 1, unit: 'เครื่อง', description: 'เครื่องฉายโปรเจกเตอร์ความสว่างสูง พร้อมสาย HDMI' }
+      ],
+      transactions: [
+        { id: 1, item_id: 2, item_code: 'MIC-101', item_name: 'ไมโครโฟนไร้สาย DJI Mic 2 (ชุด 2 ตัวส่ง + 1 รับ)', borrower_name: 'สมชาย สายตรวจ', borrower_contact: '089-111-2233', borrower_dept: 'ฝ่ายโสตฯ', purpose: 'ใช้บันทึกเทปสัมมนาประจำปี', qty: 1, borrowed_at: getNowDateTimeStr(-2), due_date: getTodayStr(1), returned_at: null, status: 'BORROWED', notes: '' },
+        { id: 2, item_id: 4, item_code: 'TOOL-DRL-02', item_name: 'สว่านไร้สาย Bosch GSB 18V-50 พร้อมกล่องดอกสว่าน', borrower_name: 'กมล พัฒนา', borrower_contact: '081-999-8877', borrower_dept: 'ฝ่ายอาคาร', purpose: 'ซ่อมแซมแผงไฟห้องแล็บ', qty: 1, borrowed_at: getNowDateTimeStr(-2), due_date: getTodayStr(1), returned_at: null, status: 'BORROWED', notes: '' }
+      ],
+      settings: {
+        line_notify_token: '',
+        line_webhook_url: '',
+        auto_alert_hour: '08:00'
+      }
+    };
+    saveLocalDb(initialDb);
+    return initialDb;
+  }
+
+  function saveLocalDb(dbData) {
+    try {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(dbData));
+    } catch (e) {
+      console.warn('LocalStorage write error:', e);
+    }
+  }
+
+  async function sendWebhookIfConfigured(dbData, message) {
+    const webhookUrl = (dbData.settings?.line_webhook_url || '').trim();
+    if (webhookUrl) {
+      try {
+        await originalFetch(webhookUrl, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ content: message, text: message, message })
+        });
+        return true;
+      } catch (e) {
+        console.warn('Webhook error:', e);
+      }
+    }
+    return false;
+  }
+
+  function makeJsonResponse(data, status = 200) {
+    return new Response(JSON.stringify(data), {
+      status,
+      headers: { 'Content-Type': 'application/json' }
+    });
+  }
+
+  async function handleLocalApi(urlStr, options = {}) {
+    const url = new URL(urlStr, window.location.origin);
+    const path = url.pathname;
+    const method = (options.method || 'GET').toUpperCase();
+    const body = options.body ? JSON.parse(options.body) : {};
+    const dbData = loadLocalDb();
+    const today = getTodayStr(0);
+
+    // 1. GET /api/stats
+    if (path.endsWith('/api/stats') && method === 'GET') {
+      const totalItems = dbData.items.length;
+      const totalQty = dbData.items.reduce((s, i) => s + Number(i.total_qty || 0), 0);
+      const availableQty = dbData.items.reduce((s, i) => s + Number(i.available_qty || 0), 0);
+      const activeBorrows = dbData.transactions.filter(t => t.status === 'BORROWED').length;
+      const overdueBorrows = dbData.transactions.filter(t => t.status === 'BORROWED' && t.due_date < today).length;
+      return makeJsonResponse({ totalItems, totalQty, availableQty, activeBorrows, overdueBorrows });
+    }
+
+    // 2. GET /api/items
+    if (path.endsWith('/api/items') && method === 'GET') {
+      const search = (url.searchParams.get('search') || '').toLowerCase();
+      const cat = url.searchParams.get('category') || 'ALL';
+      let list = dbData.items.filter(i => {
+        const matchSearch = !search || i.name.toLowerCase().includes(search) || i.code.toLowerCase().includes(search) || (i.location || '').toLowerCase().includes(search);
+        const matchCat = !cat || cat === 'ALL' || i.category === cat;
+        return matchSearch && matchCat;
+      });
+      list.sort((a, b) => b.id - a.id);
+      return makeJsonResponse(list);
+    }
+
+    // 3. GET /api/items/code/:code
+    const codeMatch = path.match(/\/api\/items\/code\/(.+)$/);
+    if (codeMatch && method === 'GET') {
+      const code = decodeURIComponent(codeMatch[1]).trim().toUpperCase();
+      const item = dbData.items.find(i => i.code.toUpperCase() === code);
+      if (!item) return makeJsonResponse({ error: 'ไม่พบอุปกรณ์ที่ตรงกับรหัสนี้' }, 404);
+      const activeTx = dbData.transactions
+        .filter(t => t.item_id === item.id && t.status === 'BORROWED')
+        .sort((a, b) => a.due_date.localeCompare(b.due_date));
+      return makeJsonResponse({ item, activeTx });
+    }
+
+    // 4. POST /api/items
+    if (path.endsWith('/api/items') && method === 'POST') {
+      const { code, name, category, location, total_qty, unit, description } = body;
+      if (!code || !name) return makeJsonResponse({ error: 'กรุณาระบุรหัสอุปกรณ์และชื่ออุปกรณ์' }, 400);
+      if (dbData.items.some(i => i.code.toUpperCase() === code.trim().toUpperCase())) {
+        return makeJsonResponse({ error: 'รหัสอุปกรณ์ (Barcode/QR) นี้มีอยู่ในระบบแล้ว' }, 400);
+      }
+      const qty = parseInt(total_qty, 10) || 1;
+      const newItem = {
+        id: dbData.nextItemId++,
+        code: code.trim().toUpperCase(),
+        name: name.trim(),
+        category: category || 'ทั่วไป',
+        location: location || '',
+        total_qty: qty,
+        available_qty: qty,
+        unit: unit || 'ชิ้น',
+        description: description || ''
+      };
+      dbData.items.push(newItem);
+      saveLocalDb(dbData);
+      return makeJsonResponse({ success: true, id: newItem.id });
+    }
+
+    // 5. PUT & DELETE /api/items/:id
+    const itemIdMatch = path.match(/\/api\/items\/(\d+)$/);
+    if (itemIdMatch) {
+      const id = Number(itemIdMatch[1]);
+      const idx = dbData.items.findIndex(i => i.id === id);
+      if (idx === -1) return makeJsonResponse({ error: 'ไม่พบอุปกรณ์' }, 404);
+
+      if (method === 'PUT') {
+        const current = dbData.items[idx];
+        const newTotal = parseInt(body.total_qty, 10) || 1;
+        const diff = newTotal - current.total_qty;
+        const newAvailable = Math.max(0, current.available_qty + diff);
+        dbData.items[idx] = {
+          ...current,
+          code: (body.code || current.code).trim().toUpperCase(),
+          name: (body.name || current.name).trim(),
+          category: body.category || 'ทั่วไป',
+          location: body.location || '',
+          total_qty: newTotal,
+          available_qty: newAvailable,
+          unit: body.unit || 'ชิ้น',
+          description: body.description || ''
+        };
+        saveLocalDb(dbData);
+        return makeJsonResponse({ success: true });
+      }
+
+      if (method === 'DELETE') {
+        const hasActive = dbData.transactions.some(t => t.item_id === id && t.status === 'BORROWED');
+        if (hasActive) return makeJsonResponse({ error: 'ไม่สามารถลบได้เนื่องจากมีรายการที่ยังไม่ส่งคืน' }, 400);
+        dbData.items.splice(idx, 1);
+        saveLocalDb(dbData);
+        return makeJsonResponse({ success: true });
+      }
+    }
+
+    // 6. POST /api/borrow
+    if (path.endsWith('/api/borrow') && method === 'POST') {
+      const { item_code, borrower_name, borrower_contact, borrower_dept, purpose, due_date, qty } = body;
+      const borrowQty = parseInt(qty, 10) || 1;
+      if (!item_code || !borrower_name || !borrower_contact || !due_date) {
+        return makeJsonResponse({ error: 'กรุณากรอกข้อมูลให้ครบถ้วน' }, 400);
+      }
+      const item = dbData.items.find(i => i.code.toUpperCase() === item_code.trim().toUpperCase());
+      if (!item) return makeJsonResponse({ error: 'ไม่พบอุปกรณ์รหัสนี้' }, 404);
+      if (item.available_qty < borrowQty) {
+        return makeJsonResponse({ error: `อุปกรณ์คงเหลือไม่พอ (เหลือเพียง ${item.available_qty} ${item.unit})` }, 400);
+      }
+      item.available_qty -= borrowQty;
+      const newTx = {
+        id: dbData.nextTxId++,
+        item_id: item.id,
+        item_code: item.code,
+        item_name: item.name,
+        borrower_name: borrower_name.trim(),
+        borrower_contact: borrower_contact.trim(),
+        borrower_dept: borrower_dept || '',
+        purpose: purpose || '',
+        qty: borrowQty,
+        borrowed_at: getNowDateTimeStr(0),
+        due_date,
+        returned_at: null,
+        status: 'BORROWED',
+        notes: ''
+      };
+      dbData.transactions.push(newTx);
+      saveLocalDb(dbData);
+
+      const lineMsg = `\n📦 [บันทึกการยืมอุปกรณ์]\n• อุปกรณ์: ${item.name} (${item.code})\n• จำนวน: ${borrowQty} ${item.unit}\n• ผู้ยืม: ${borrower_name} (${borrower_dept || '-'})\n• กำหนดคืน: ${due_date}`;
+      sendWebhookIfConfigured(dbData, lineMsg);
+      return makeJsonResponse({ success: true, message: 'บันทึกการยืมสำเร็จ' });
+    }
+
+    // 7. POST /api/return
+    if (path.endsWith('/api/return') && method === 'POST') {
+      const { transaction_id, return_notes } = body;
+      const tx = dbData.transactions.find(t => t.id === Number(transaction_id));
+      if (!tx) return makeJsonResponse({ error: 'ไม่พบข้อมูลรายการยืม' }, 404);
+      if (tx.status === 'RETURNED') return makeJsonResponse({ error: 'รายการนี้ได้รับการส่งคืนไปแล้ว' }, 400);
+
+      tx.status = 'RETURNED';
+      tx.returned_at = getNowDateTimeStr(0);
+      tx.notes = return_notes || '';
+
+      const item = dbData.items.find(i => i.id === tx.item_id);
+      if (item) item.available_qty = Math.min(item.total_qty, item.available_qty + tx.qty);
+      saveLocalDb(dbData);
+
+      const lineMsg = `\n✅ [บันทึกการคืนอุปกรณ์]\n• อุปกรณ์: ${tx.item_name} (${tx.item_code})\n• ผู้ส่งคืน: ${tx.borrower_name}\n• สภาพ: ${return_notes || 'ปกติ'}`;
+      sendWebhookIfConfigured(dbData, lineMsg);
+      return makeJsonResponse({ success: true, message: 'บันทึกการคืนสำเร็จ' });
+    }
+
+    // 8. GET /api/transactions
+    if (path.endsWith('/api/transactions') && method === 'GET') {
+      const status = url.searchParams.get('status') || 'ALL';
+      const search = (url.searchParams.get('search') || '').toLowerCase();
+      let list = dbData.transactions.map(t => ({
+        ...t,
+        is_overdue: (t.status === 'BORROWED' && t.due_date < today) ? 1 : 0
+      })).filter(t => {
+        const matchSearch = !search || t.item_name.toLowerCase().includes(search) || t.item_code.toLowerCase().includes(search) || t.borrower_name.toLowerCase().includes(search);
+        if (!matchSearch) return false;
+        if (status === 'BORROWED') return t.status === 'BORROWED';
+        if (status === 'RETURNED') return t.status === 'RETURNED';
+        if (status === 'OVERDUE') return t.status === 'BORROWED' && t.due_date < today;
+        return true;
+      });
+      list.sort((a, b) => b.id - a.id);
+      return makeJsonResponse(list);
+    }
+
+    // 9. GET / POST /api/settings
+    if (path.endsWith('/api/settings')) {
+      if (method === 'GET') return makeJsonResponse(dbData.settings || {});
+      if (method === 'POST') {
+        dbData.settings = {
+          ...dbData.settings,
+          line_notify_token: (body.line_notify_token || '').trim(),
+          line_webhook_url: (body.line_webhook_url || '').trim()
+        };
+        saveLocalDb(dbData);
+        return makeJsonResponse({ success: true, message: 'บันทึกการตั้งค่าแล้ว' });
+      }
+    }
+
+    // 10. POST /api/test-notify & /api/trigger-alert
+    if (path.endsWith('/api/test-notify') && method === 'POST') {
+      const sent = await sendWebhookIfConfigured(dbData, '🔔 ทดสอบการแจ้งเตือนจากระบบ Asset Tracker');
+      return makeJsonResponse({ success: true, sent });
+    }
+    if (path.endsWith('/api/trigger-alert') && method === 'POST') {
+      const dues = dbData.transactions.filter(t => t.status === 'BORROWED');
+      await sendWebhookIfConfigured(dbData, `📢 แจ้งเตือนรายการยืมค้างส่งจำนวน ${dues.length} รายการ`);
+      return makeJsonResponse({ success: true, message: `ตรวจสอบและแจ้งเตือนรายการค้างส่ง (${dues.length} รายการ) เรียบร้อยแล้ว` });
+    }
+
+    // 11. GET /api/categories
+    if (path.endsWith('/api/categories') && method === 'GET') {
+      const cats = [...new Set(dbData.items.map(i => i.category).filter(Boolean))];
+      return makeJsonResponse(cats);
+    }
+
+    return makeJsonResponse({ error: 'Not found' }, 404);
+  }
+
+  const originalFetch = window.fetch.bind(window);
+  let useLocalFallback = window.location.hostname.includes('github.io') || window.location.hostname.includes('vercel.app') || window.location.protocol === 'file:';
+
+  window.fetch = async function(input, init) {
+    const urlStr = typeof input === 'string' ? input : input.url;
+    if (urlStr.includes('/api/')) {
+      if (useLocalFallback) {
+        return handleLocalApi(urlStr, init);
+      }
+      try {
+        const res = await originalFetch(input, init);
+        if (!res.ok && res.status === 404 && !res.headers.get('content-type')?.includes('application/json')) {
+          useLocalFallback = true;
+          return handleLocalApi(urlStr, init);
+        }
+        return res;
+      } catch (err) {
+        useLocalFallback = true;
+        return handleLocalApi(urlStr, init);
+      }
+    }
+    return originalFetch(input, init);
+  };
+})();
+
 // Initialize on DOM Ready
 document.addEventListener('DOMContentLoaded', () => {
   try {
